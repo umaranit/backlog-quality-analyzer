@@ -1,0 +1,330 @@
+trigger: none  # Manual trigger for testing
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+parameters:
+  - name: analyzeTop
+    displayName: 'Number of work items to analyze'
+    type: number
+    default: 5
+
+variables:
+  - group: 'copilot-credentials'  # Create this variable group with GITHUB_TOKEN
+  - name: PROJECT_NAME_ENCODED
+    value: 'Parts%20Unlimited'
+
+stages:
+- stage: Setup
+  displayName: 'Setup Environment'
+  jobs:
+  - job: InstallTools
+    displayName: 'Install Prerequisites'
+    steps:
+    
+    - script: |
+        echo "=== INSTALLING PREREQUISITES ==="
+        
+        # Install Node.js v22 (required for new Copilot CLI)
+        curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
+        sudo apt-get install -y nodejs jq
+        
+        # Verify Node.js and npm versions
+        echo "Node.js version: $(node --version)"
+        echo "npm version: $(npm --version)"
+        
+        # Install GitHub Copilot CLI globally
+        sudo npm install -g @github/copilot
+        
+        # Verify Copilot CLI installation
+        echo "GitHub Copilot CLI version:"
+        copilot --version || echo "Copilot CLI installed"
+        
+        echo "✅ Prerequisites installed successfully"
+        
+      displayName: 'Install Node.js and Copilot CLI'
+    
+    - script: |
+        # Set environment variables for authentication
+        export GITHUB_TOKEN="$(GITHUB_TOKEN)"
+        export GH_TOKEN="$(GITHUB_TOKEN)"
+        
+        echo "=== TESTING COPILOT CLI AUTHENTICATION ==="
+        
+        # Verify token is set
+        if [ -z "$GITHUB_TOKEN" ]; then
+          echo "❌ ERROR: GITHUB_TOKEN is not set!"
+          exit 1
+        fi
+        
+        echo "✅ GITHUB_TOKEN is set (length: ${#GITHUB_TOKEN})"
+        
+        # Test Copilot with simple prompt
+        echo "Testing Copilot CLI..."
+        echo "What is 2+2?" | timeout 10 copilot 2>&1
+        
+        if [ $? -eq 0 ]; then
+          echo "✅ Copilot CLI authenticated and working"
+        else
+          echo "❌ ERROR: Copilot CLI test failed!"
+          echo "Trying with explicit auth..."
+          
+          # Try with explicit token
+          echo "What is 2+2?" | GITHUB_TOKEN="$GITHUB_TOKEN" timeout 10 copilot 2>&1
+          
+          if [ $? -ne 0 ]; then
+            echo "❌ CRITICAL: Copilot CLI is not working properly"
+            exit 1
+          fi
+        fi
+        
+      displayName: 'Test Copilot Authentication'
+      env:
+        GITHUB_TOKEN: $(GITHUB_TOKEN)
+        GH_TOKEN: $(GITHUB_TOKEN)
+
+- stage: FetchWorkItems
+  displayName: 'Fetch Work Items'
+  dependsOn: Setup
+  condition: succeeded()
+  jobs:
+  - job: GetWorkItems
+    displayName: 'Get User Stories and PBIs'
+    steps:
+    
+    - script: |
+        echo "=== FETCHING WORK ITEMS FROM AZURE DEVOPS ==="
+        
+        # Create WIQL query
+        cat > query.json << 'EOF'
+        {
+          "query": "SELECT [System.Id], [System.Title], [System.WorkItemType], [System.State], [System.Description], [Microsoft.VSTS.Common.AcceptanceCriteria], [Microsoft.VSTS.Common.Priority], [Microsoft.VSTS.Scheduling.StoryPoints] FROM WorkItems WHERE [System.TeamProject] = 'Parts Unlimited' AND [System.WorkItemType] IN ('User Story', 'Product Backlog Item') AND [System.State] NOT IN ('Closed', 'Done', 'Removed') ORDER BY [Microsoft.VSTS.Common.Priority], [System.ChangedDate] DESC"
+        }
+        EOF
+        
+        # Execute query
+        curl -s -X POST \
+             -H "Authorization: Bearer $(System.AccessToken)" \
+             -H "Content-Type: application/json" \
+             -d @query.json \
+             "$(System.CollectionUri)$(PROJECT_NAME_ENCODED)/_apis/wit/wiql?api-version=7.0" \
+             -o workitem_ids.json
+        
+        # Get work item IDs
+        IDS=$(cat workitem_ids.json | jq -r ".workItems[:${{ parameters.analyzeTop }}] | map(.id) | join(\",\")")
+        
+        if [ -n "$IDS" ]; then
+          echo "Fetching details for: $IDS"
+          
+          # Fetch detailed work items
+          curl -s -H "Authorization: Bearer $(System.AccessToken)" \
+               "$(System.CollectionUri)$(PROJECT_NAME_ENCODED)/_apis/wit/workitems?ids=${IDS}&\$expand=all&api-version=7.0" \
+               -o workitems_detailed.json
+          
+          # Display summary
+          echo ""
+          echo "=== WORK ITEMS FETCHED ==="
+          cat workitems_detailed.json | jq -r '.value[] | "ID: \(.id) | Title: \(.fields."System.Title")"'
+          echo ""
+          
+          # Save to artifacts directory
+          cp workitems_detailed.json $(Agent.TempDirectory)/
+          echo "✅ Successfully fetched $(cat workitems_detailed.json | jq '.value | length') work items"
+        else
+          echo "❌ No work items found"
+          exit 1
+        fi
+        
+      displayName: 'Fetch Work Items'
+      env:
+        SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+    
+    - task: PublishBuildArtifacts@1
+      displayName: 'Publish Work Items Data'
+      inputs:
+        pathToPublish: '$(Agent.TempDirectory)/workitems_detailed.json'
+        artifactName: 'workitems-data'
+
+- stage: AnalyzeWithCopilot
+  displayName: 'Analyze with GitHub Copilot'
+  dependsOn: 
+    - Setup
+    - FetchWorkItems
+  condition: succeeded()
+  jobs:
+  - job: CopilotAnalysis
+    displayName: 'Run Copilot Analysis'
+    steps:
+    
+    - script: |
+        # Reinstall Copilot CLI in this job
+        curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
+        sudo apt-get install -y nodejs jq
+        sudo npm install -g @github/copilot
+        
+        echo "✅ Copilot CLI ready"
+        
+      displayName: 'Setup Copilot CLI'
+    
+    - task: DownloadBuildArtifacts@0
+      displayName: 'Download Work Items Data'
+      inputs:
+        artifactName: 'workitems-data'
+        downloadPath: '$(Agent.TempDirectory)'
+    
+    - script: |
+        # Set authentication tokens
+        export GITHUB_TOKEN="$(GITHUB_TOKEN)"
+        export GH_TOKEN="$(GITHUB_TOKEN)"
+        
+        echo "=== STARTING COPILOT ANALYSIS ==="
+        
+        # Verify token
+        if [ -z "$GITHUB_TOKEN" ]; then
+          echo "❌ ERROR: GITHUB_TOKEN not set!"
+          exit 1
+        fi
+        
+        # Test Copilot is working first
+        echo "Testing Copilot..."
+        TEST_RESULT=$(echo "Say 'working'" | timeout 10 copilot 2>&1)
+        TEST_EXIT=$?
+        
+        if [ $TEST_EXIT -ne 0 ]; then
+          echo "❌ ERROR: Copilot test failed (exit code: $TEST_EXIT)"
+          echo "Response: $TEST_RESULT"
+          exit 1
+        fi
+        
+        echo "✅ Copilot test passed"
+        
+        # Initialize report
+        cat > $(Agent.TempDirectory)/analysis-report.md << 'HEADER'
+        # 📋 User Stories & Product Backlog Items Analysis Report
+        
+        **Generated:** $(date '+%Y-%m-%d %H:%M:%S UTC')
+        **Project:** Parts Unlimited  
+        **Pipeline Run:** $(Build.BuildId)
+        
+        ---
+        
+        ## 📝 Detailed Analysis
+        
+        HEADER
+        
+        # Process work items with simpler approach
+        PROCESSED=0
+        MAX_ITEMS=${{ parameters.analyzeTop }}
+        
+        # Use for loop instead of while to avoid subshell issues
+        for i in $(seq 0 $((MAX_ITEMS - 1))); do
+          # Get work item at index i
+          ITEM=$(cat $(Agent.TempDirectory)/workitems-data/workitems_detailed.json | jq -c ".value[$i]")
+          
+          if [ "$ITEM" = "null" ] || [ -z "$ITEM" ]; then
+            echo "No more items to process"
+            break
+          fi
+          
+          # Extract fields
+          WI_ID=$(echo "$ITEM" | jq -r '.id')
+          WI_TITLE=$(echo "$ITEM" | jq -r '.fields."System.Title" // "Untitled"' | sed 's/["`]//g' | head -c 100)
+          WI_DESC=$(echo "$ITEM" | jq -r '.fields."System.Description" // "No description"' | sed 's/<[^>]*>//g' | head -c 200 | sed 's/["`]//g')
+          
+          echo ""
+          echo "=== Processing #$WI_ID: $WI_TITLE ==="
+          
+          # Simple prompt
+          PROMPT="Analyze this user story and rate quality 1-10: Title: $WI_TITLE. Description: $WI_DESC. Provide: 1) Score, 2) Issues, 3) One key recommendation."
+          
+          # Call Copilot with timeout - FAIL if it doesn't work
+          echo "Calling Copilot..."
+          ANALYSIS=$(echo "$PROMPT" | timeout 60 copilot 2>&1)
+          COPILOT_EXIT=$?
+          
+          if [ $COPILOT_EXIT -eq 124 ]; then
+            echo "❌ ERROR: Copilot timeout for #$WI_ID"
+            exit 1  # FAIL the pipeline
+          fi
+          
+          if [ $COPILOT_EXIT -ne 0 ]; then
+            echo "❌ ERROR: Copilot failed for #$WI_ID (exit: $COPILOT_EXIT)"
+            echo "Response: $ANALYSIS"
+            exit 1  # FAIL the pipeline
+          fi
+          
+          echo "✅ Analysis complete for #$WI_ID"
+          
+          # Add to report
+          cat >> $(Agent.TempDirectory)/analysis-report.md << WORKITEM
+        
+        ### Work Item #${WI_ID}: ${WI_TITLE}
+        
+        **Copilot Analysis:**
+        
+        ${ANALYSIS}
+        
+        ---
+        
+        WORKITEM
+          
+          PROCESSED=$((PROCESSED + 1))
+        done
+        
+        echo ""
+        echo "✅ Analysis complete. Processed $PROCESSED items."
+        
+        # Verify we processed at least one item
+        if [ $PROCESSED -eq 0 ]; then
+          echo "❌ ERROR: No items were processed!"
+          exit 1
+        fi
+        
+      displayName: 'Analyze Work Items with Copilot'
+      env:
+        GITHUB_TOKEN: $(GITHUB_TOKEN)
+        GH_TOKEN: $(GITHUB_TOKEN)
+    
+    - task: PublishBuildArtifacts@1
+      displayName: 'Publish Analysis Report'
+      inputs:
+        pathToPublish: '$(Agent.TempDirectory)/analysis-report.md'
+        artifactName: 'copilot-analysis-report'
+      condition: always()
+
+- stage: GenerateSummary
+  displayName: 'Generate Final Summary'
+  dependsOn: AnalyzeWithCopilot
+  condition: succeededOrFailed()
+  jobs:
+  - job: CreateSummary
+    displayName: 'Create Summary Report'
+    steps:
+    
+    - task: DownloadBuildArtifacts@0
+      displayName: 'Download Analysis Report'
+      inputs:
+        artifactName: 'copilot-analysis-report'
+        downloadPath: '$(Agent.TempDirectory)'
+      continueOnError: true
+    
+    - script: |
+        echo "================================================"
+        echo "  📋 PIPELINE EXECUTION SUMMARY"
+        echo "================================================"
+        echo ""
+        echo "Pipeline Run: $(Build.BuildId)"
+        echo "Date: $(date)"
+        echo ""
+        
+        if [ -f "$(Agent.TempDirectory)/copilot-analysis-report/analysis-report.md" ]; then
+          echo "✅ Analysis Report Generated"
+          echo ""
+          echo "📄 Report Preview:"
+          echo "=================================="
+          head -30 $(Agent.TempDirectory)/copilot-analysis-report/analysis-report.md
+        else
+          echo "⚠️ Analysis report not found"
+        fi
+        
+      displayName: 'Final Summary'
